@@ -2152,3 +2152,42 @@ func TestToString(t *testing.T) {
 		})
 	}
 }
+
+// TestLatestValuesSkipsDCPFieldsNotWatchedForModel verifies a scrape never
+// requests a DCP field the entity's GPU model was not watched for, which DCGM
+// would answer with DCGM_ST_NOT_WATCHED and trigger the repair loop.
+func TestLatestValuesSkipsDCPFieldsNotWatchedForModel(t *testing.T) {
+	realDCGM := dcgmprovider.Client()
+	t.Cleanup(func() { dcgmprovider.SetClient(realDCGM) })
+
+	ctrl := gomock.NewController(t)
+	mockDCGM := mockdcgm.NewMockDCGM(ctrl)
+	dcgmprovider.SetClient(mockDCGM)
+
+	const a30, rtx = "NVIDIA A30", "NVIDIA RTX 2000 Ada Generation"
+	fp64 := dcgm.Short(dcgm.DCGM_FI_PROF_PIPE_FP64_ACTIVE)
+	temp := dcgm.Short(dcgm.DCGM_FI_DEV_GPU_TEMP)
+	mockDCGM.EXPECT().GetAllDeviceCount().Return(uint(2), nil)
+	mockDCGM.EXPECT().GetDeviceInfo(uint(0)).Return(dcgm.Device{GPU: 0, Identifiers: dcgm.DeviceIdentifiers{Model: a30}}, nil)
+	mockDCGM.EXPECT().GetDeviceInfo(uint(1)).Return(dcgm.Device{GPU: 1, Identifiers: dcgm.DeviceIdentifiers{Model: rtx}}, nil)
+	mockDCGM.EXPECT().GetSupportedMetricGroups(uint(0)).Return([]dcgm.MetricGroup{{FieldIds: []uint{uint(fp64)}}}, nil)
+	mockDCGM.EXPECT().GetSupportedMetricGroups(uint(1)).Return(nil, nil)
+	_, _, err := devicewatcher.RefreshDCPSupport()
+	require.NoError(t, err)
+	t.Cleanup(devicewatcher.ResetDCPSupport)
+
+	entity := func(id uint, model string) devicemonitoring.Info {
+		return devicemonitoring.Info{
+			Entity:     dcgm.GroupEntityPair{EntityGroupId: dcgm.FE_GPU, EntityId: id},
+			DeviceInfo: dcgm.Device{GPU: id, Identifiers: dcgm.DeviceIdentifiers{Model: model}},
+		}
+	}
+	mockDCGM.EXPECT().EntityGetLatestValues(dcgm.FE_GPU, uint(0), []dcgm.Short{temp, fp64}).Return(nil, nil)
+	mockDCGM.EXPECT().EntityGetLatestValues(dcgm.FE_GPU, uint(1), []dcgm.Short{temp}).Return(nil, nil)
+
+	c := &DCGMCollector{}
+	_, err = c.latestValuesForFields(entity(0, a30), []dcgm.Short{temp, fp64})
+	require.NoError(t, err)
+	_, err = c.latestValuesForFields(entity(1, rtx), []dcgm.Short{temp, fp64})
+	require.NoError(t, err)
+}
