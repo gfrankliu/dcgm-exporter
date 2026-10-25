@@ -59,6 +59,10 @@ func metricGroups(fields ...dcgm.Short) []dcgm.MetricGroup {
 	return []dcgm.MetricGroup{{FieldIds: ids}}
 }
 
+func modelDevice(model string) dcgm.Device {
+	return dcgm.Device{Identifiers: dcgm.DeviceIdentifiers{Model: model}}
+}
+
 func withMockDCGM(t *testing.T) (*gomock.Controller, *mockdcgm.MockDCGM) {
 	t.Helper()
 	realDCGM := dcgmprovider.Client()
@@ -173,8 +177,8 @@ func TestRefreshDCPSupport_UnionAcrossModels(t *testing.T) {
 	assert.Equal(t, []string{a30Model, rtx2000Model}, models)
 	assert.Equal(t, map[dcgm.Short]bool{fp64Active: true, smActive: true, grEngineActive: true}, dcpFieldSet(groups))
 	all := []dcgm.Short{fbUsed, fp64Active, smActive, grEngineActive}
-	assert.Equal(t, []dcgm.Short{fbUsed, fp64Active, smActive}, FilterUnwatchedDCPFields(a30Model, all))
-	assert.Equal(t, []dcgm.Short{fbUsed, smActive, grEngineActive}, FilterUnwatchedDCPFields(rtx2000Model, all))
+	assert.Equal(t, []dcgm.Short{fbUsed, fp64Active, smActive}, FilterUnwatchedDCPFields(modelDevice(a30Model), all))
+	assert.Equal(t, []dcgm.Short{fbUsed, smActive, grEngineActive}, FilterUnwatchedDCPFields(modelDevice(rtx2000Model), all))
 }
 
 // TestRefreshDCPSupport_GPU0FailureKeepsOtherModels: a failed query for one
@@ -190,7 +194,7 @@ func TestRefreshDCPSupport_GPU0FailureKeepsOtherModels(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{rtx2000Model}, models)
 	assert.Equal(t, map[dcgm.Short]bool{smActive: true}, dcpFieldSet(groups))
-	assert.Equal(t, []dcgm.Short{fbUsed}, FilterUnwatchedDCPFields(a30Model, []dcgm.Short{fbUsed, smActive}))
+	assert.Equal(t, []dcgm.Short{fbUsed}, FilterUnwatchedDCPFields(modelDevice(a30Model), []dcgm.Short{fbUsed, smActive}))
 }
 
 func TestRefreshDCPSupport_AllModelsFail(t *testing.T) {
@@ -215,7 +219,7 @@ func TestRefreshDCPSupport_EnumerationFailureFallsBackToGPU0(t *testing.T) {
 	assert.Equal(t, []string{"unknown"}, models)
 	assert.Equal(t, metricGroups(fp64Active), groups)
 	// Nothing cached, so scrape filtering passes fields through.
-	assert.Equal(t, []dcgm.Short{fbUsed, fp64Active}, FilterUnwatchedDCPFields(a30Model, []dcgm.Short{fbUsed, fp64Active}))
+	assert.Equal(t, []dcgm.Short{fbUsed, fp64Active}, FilterUnwatchedDCPFields(modelDevice(a30Model), []dcgm.Short{fbUsed, fp64Active}))
 }
 
 // TestWatchDeviceFieldGroups_PartitionsMixedGPUModels reproduces #657: the
@@ -253,12 +257,83 @@ func TestWatchDeviceFieldGroups_PartitionsMixedGPUModels(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []dcgm.GroupHandle{a30Group, rtxGroup}, groups)
 	assert.Equal(t, []dcgm.FieldHandle{a30FieldGroup, rtxFieldGroup}, fieldGroups)
-	assert.Equal(t, []dcgm.Short{fbUsed, fp64Active}, FilterUnwatchedDCPFields(a30Model, []dcgm.Short{fbUsed, fp64Active}))
-	assert.Equal(t, []dcgm.Short{fbUsed}, FilterUnwatchedDCPFields(rtx2000Model, []dcgm.Short{fbUsed, fp64Active}))
+	assert.Equal(t, []dcgm.Short{fbUsed, fp64Active}, FilterUnwatchedDCPFields(modelDevice(a30Model), []dcgm.Short{fbUsed, fp64Active}))
+	assert.Equal(t, []dcgm.Short{fbUsed}, FilterUnwatchedDCPFields(modelDevice(rtx2000Model), []dcgm.Short{fbUsed, fp64Active}))
 
+	// Cleanup unwatches each field group only on the group it was watched on;
+	// any cross-model UnwatchFields call would fail as unexpected.
+	require.Len(t, cleanups, 1)
+	mockDCGM.EXPECT().UnwatchFields(a30FieldGroup, a30Group).Return(nil)
+	mockDCGM.EXPECT().UnwatchFields(rtxFieldGroup, rtxGroup).Return(nil)
+	mockDCGM.EXPECT().FieldGroupDestroy(gomock.Any()).Return(nil).Times(2)
+	mockDCGM.EXPECT().DestroyGroup(gomock.Any()).Return(nil).Times(2)
+	cleanups[0]()
+}
+
+// TestWatchDeviceFieldGroups_SkipsModelWithNothingToWatch: a model that
+// supports none of the requested fields gets no DCGM group at all.
+func TestWatchDeviceFieldGroups_SkipsModelWithNothingToWatch(t *testing.T) {
+	ctrl, mockDCGM := withMockDCGM(t)
+	deviceInfo := mockGPUDeviceInfo(ctrl, a30Model, rtx2000Model)
+
+	a30Group := dcgm.GroupHandle{}
+	a30Group.SetHandle(1)
+	mockDCGM.EXPECT().CreateGroup(gomock.Any()).Return(a30Group, nil).Times(1)
+	mockDCGM.EXPECT().AddEntityToGroup(a30Group, dcgm.FE_GPU, uint(0)).Return(nil)
+	mockDCGM.EXPECT().GetSupportedMetricGroups(uint(0)).Return(metricGroups(fp64Active), nil)
+	mockDCGM.EXPECT().GetSupportedMetricGroups(uint(1)).Return(nil, nil)
+
+	fieldGroup := dcgm.FieldHandle{}
+	fieldGroup.SetHandle(10)
+	mockDCGM.EXPECT().FieldGroupCreate(gomock.Any(), []dcgm.Short{fp64Active}).Return(fieldGroup, nil)
+	mockDCGM.EXPECT().WatchFieldsWithGroupEx(fieldGroup, a30Group, gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+
+	groups, _, cleanups, err := NewDeviceWatcher().WatchDeviceFieldGroups(
+		[]FieldWatchGroup{{Name: "profiling", Fields: []dcgm.Short{fp64Active}, IntervalMSec: 1000}},
+		deviceInfo,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, []dcgm.GroupHandle{a30Group}, groups)
 	require.Len(t, cleanups, 1)
 	expectCleanup(mockDCGM)
 	cleanups[0]()
+}
+
+// TestWatchDeviceFieldGroups_UnidentifiedGPUsGetSeparateGroups: GPUs whose
+// model name DCGM could not report may be different models, so each gets its
+// own group and its own support query instead of sharing one.
+func TestWatchDeviceFieldGroups_UnidentifiedGPUsGetSeparateGroups(t *testing.T) {
+	ctrl, mockDCGM := withMockDCGM(t)
+	deviceInfo := mockGPUDeviceInfo(ctrl, "", "")
+
+	mockDCGM.EXPECT().CreateGroup(gomock.Any()).Return(dcgm.GroupHandle{}, nil).Times(2)
+	mockDCGM.EXPECT().AddEntityToGroup(gomock.Any(), dcgm.FE_GPU, uint(0)).Return(nil)
+	mockDCGM.EXPECT().AddEntityToGroup(gomock.Any(), dcgm.FE_GPU, uint(1)).Return(nil)
+	mockDCGM.EXPECT().GetSupportedMetricGroups(uint(0)).Return(metricGroups(fp64Active), nil)
+	mockDCGM.EXPECT().GetSupportedMetricGroups(uint(1)).Return(nil, nil)
+	mockDCGM.EXPECT().FieldGroupCreate(gomock.Any(), []dcgm.Short{fbUsed, fp64Active}).Return(dcgm.FieldHandle{}, nil)
+	mockDCGM.EXPECT().FieldGroupCreate(gomock.Any(), []dcgm.Short{fbUsed}).Return(dcgm.FieldHandle{}, nil)
+	mockDCGM.EXPECT().WatchFieldsWithGroupEx(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(2)
+
+	_, _, cleanups, err := NewDeviceWatcher().WatchDeviceFieldGroups(
+		[]FieldWatchGroup{{Name: "default", Fields: []dcgm.Short{fbUsed, fp64Active}, IntervalMSec: 1000}},
+		deviceInfo,
+	)
+
+	require.NoError(t, err)
+	all := []dcgm.Short{fbUsed, fp64Active}
+	assert.Equal(t, all, FilterUnwatchedDCPFields(dcgm.Device{GPU: 0}, all))
+	assert.Equal(t, []dcgm.Short{fbUsed}, FilterUnwatchedDCPFields(dcgm.Device{GPU: 1}, all))
+	expectCleanup(mockDCGM)
+	for _, cleanup := range cleanups {
+		cleanup()
+	}
+}
+
+func TestGPUModelKey(t *testing.T) {
+	assert.Equal(t, a30Model, gpuModelKey(dcgm.Device{GPU: 3, Identifiers: dcgm.DeviceIdentifiers{Model: a30Model}}))
+	assert.NotEqual(t, gpuModelKey(dcgm.Device{GPU: 0}), gpuModelKey(dcgm.Device{GPU: 1}))
 }
 
 // TestWatchDeviceFieldGroups_QueryErrorFailsClosed: when a model's support
@@ -286,7 +361,7 @@ func TestWatchDeviceFieldGroups_QueryErrorFailsClosed(t *testing.T) {
 		}
 	}
 
-	assert.Equal(t, []dcgm.Short{fbUsed}, FilterUnwatchedDCPFields(rtx2000Model, []dcgm.Short{fbUsed, fp64Active}))
+	assert.Equal(t, []dcgm.Short{fbUsed}, FilterUnwatchedDCPFields(modelDevice(rtx2000Model), []dcgm.Short{fbUsed, fp64Active}))
 }
 
 // TestWatchDeviceFieldGroups_SingleModelUsesOneGroup: a single-model node

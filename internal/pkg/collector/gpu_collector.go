@@ -315,7 +315,7 @@ func (c *DCGMCollector) latestValuesForFields(
 		// DCP fields are watched per GPU model; requesting one that was not
 		// watched for this model returns DCGM_ST_NOT_WATCHED and would trigger
 		// the profiling watch repair loop.
-		fields = devicewatcher.FilterUnwatchedDCPFields(mi.DeviceInfo.Identifiers.Model, fields)
+		fields = devicewatcher.FilterUnwatchedDCPFields(mi.DeviceInfo, fields)
 	}
 
 	values := make([]dcgm.FieldValue_v1, 0, len(fields))

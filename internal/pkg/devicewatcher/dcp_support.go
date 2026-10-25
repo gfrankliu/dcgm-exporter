@@ -17,6 +17,7 @@
 package devicewatcher
 
 import (
+	"fmt"
 	"log/slog"
 	"sort"
 	"sync"
@@ -99,12 +100,13 @@ func RefreshDCPSupport() ([]dcgm.MetricGroup, []string, error) {
 	return union, models, nil
 }
 
-// FilterUnwatchedDCPFields drops DCP fields that were not watched for the GPU
-// model, leaving other fields untouched. Models absent from the cache were
-// never watched through the per-model path, so their fields pass through.
-func FilterUnwatchedDCPFields(model string, fields []dcgm.Short) []dcgm.Short {
+// FilterUnwatchedDCPFields drops DCP fields that were not watched for the
+// device's GPU model, leaving other fields untouched. Models absent from the
+// cache were never watched through the per-model path, so their fields pass
+// through.
+func FilterUnwatchedDCPFields(device dcgm.Device, fields []dcgm.Short) []dcgm.Short {
 	dcpSupport.RLock()
-	supported, ok := dcpSupport.byModel[model]
+	supported, ok := dcpSupport.byModel[gpuModelKey(device)]
 	dcpSupport.RUnlock()
 	if !ok {
 		return fields
@@ -134,7 +136,7 @@ func representativeGPUsByModel() ([]gpuModelRepresentative, error) {
 				slog.Uint64("gpu_id", uint64(gpuID)), slog.String(ErrorKey, err.Error()))
 			continue
 		}
-		model := device.Identifiers.Model
+		model := gpuModelKey(device)
 		if seen[model] {
 			continue
 		}
@@ -206,14 +208,35 @@ func anyDCPField(fieldWatchGroups []FieldWatchGroup) bool {
 	return false
 }
 
-// partitionMonitoredEntitiesByModel groups entities by their GPU's model.
+// gpuModelKey identifies a GPU's model for per-model DCP support. A GPU with
+// no model name (DCGM returned only a minimal identity) gets a key of its own,
+// so unidentified GPUs of different models never share a watch group.
+func gpuModelKey(device dcgm.Device) string {
+	if device.Identifiers.Model != "" {
+		return device.Identifiers.Model
+	}
+	return fmt.Sprintf("unidentified GPU %d", device.GPU)
+}
+
+// anyFieldToWatch reports whether any watch group keeps a field after DCP
+// filtering with supported.
+func anyFieldToWatch(fieldWatchGroups []FieldWatchGroup, supported map[dcgm.Short]bool) bool {
+	for _, fieldWatchGroup := range fieldWatchGroups {
+		if len(filterFieldsForModel(fieldWatchGroup.Fields, supported)) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// partitionMonitoredEntitiesByModel groups entities by their GPU's model key.
 // models is sorted so group creation order is deterministic.
 func partitionMonitoredEntitiesByModel(
 	monitoringInfo []devicemonitoring.Info,
 ) ([]string, map[string][]devicemonitoring.Info) {
 	byModel := make(map[string][]devicemonitoring.Info)
 	for _, mi := range monitoringInfo {
-		model := mi.DeviceInfo.Identifiers.Model
+		model := gpuModelKey(mi.DeviceInfo)
 		byModel[model] = append(byModel[model], mi)
 	}
 

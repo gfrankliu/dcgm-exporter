@@ -39,7 +39,15 @@ type DeviceWatcher struct{}
 type WatchResources struct {
 	groups      []dcgm.GroupHandle
 	fieldGroups []dcgm.FieldHandle
-	hasWatch    bool // tracks if WatchFields was called
+	watches     []fieldWatch // attempted WatchFields calls, in order
+	hasWatch    bool         // tracks if WatchFields was called
+}
+
+// fieldWatch is one field group watched on one group. Not every field group is
+// watched on every group: per-GPU-model groups each watch their own field groups.
+type fieldWatch struct {
+	group      dcgm.GroupHandle
+	fieldGroup dcgm.FieldHandle
 }
 
 // Cleanup releases all DCGM resources in the correct order
@@ -53,17 +61,15 @@ func (r *WatchResources) Cleanup() {
 		return
 	}
 
-	// 1. Unwatch all fields for all groups
+	// 1. Unwatch each field group on the groups it was watched on
 	if r.hasWatch {
-		for _, group := range r.groups {
-			for _, fieldGroup := range r.fieldGroups {
-				if unwatchErr := client.UnwatchFields(fieldGroup, group); unwatchErr != nil {
-					// Ignore benign errors that happen when DCGM shuts down before our cleanup
-					errMsg := unwatchErr.Error()
-					if !strings.Contains(errMsg, DCGM_ST_NOT_CONFIGURED) &&
-						!strings.Contains(errMsg, DCGM_ST_FIELD_NOT_WATCHED) {
-						slog.Warn("Failed to unwatch fields", slog.String(ErrorKey, errMsg))
-					}
+		for _, watch := range r.watches {
+			if unwatchErr := client.UnwatchFields(watch.fieldGroup, watch.group); unwatchErr != nil {
+				// Ignore benign errors that happen when DCGM shuts down before our cleanup
+				errMsg := unwatchErr.Error()
+				if !strings.Contains(errMsg, DCGM_ST_NOT_CONFIGURED) &&
+					!strings.Contains(errMsg, DCGM_ST_FIELD_NOT_WATCHED) {
+					slog.Warn("Failed to unwatch fields", slog.String(ErrorKey, errMsg))
 				}
 			}
 		}
@@ -247,7 +253,7 @@ func (d *DeviceWatcher) watchDeviceFieldGroups(
 		if anyDCPField(fieldWatchGroups) {
 			// See dcpSupport: DCP fields need one group per GPU model.
 			partitions, err = d.createGroupsPerGPUModel(
-				resources, deviceInfo, computeInstanceFieldEntities, parentGPUsOnly,
+				resources, deviceInfo, fieldWatchGroups, computeInstanceFieldEntities, parentGPUsOnly,
 			)
 			break
 		}
@@ -301,10 +307,12 @@ type watchPartition struct {
 }
 
 // createGroupsPerGPUModel creates one DCGM group per GPU model among the
-// monitored entities, recording each group in resources as it is created.
+// monitored entities, recording each group in resources as it is created. A
+// model gets no group when none of its fields survive DCP filtering.
 func (d *DeviceWatcher) createGroupsPerGPUModel(
 	resources *WatchResources,
 	deviceInfo deviceinfo.Provider,
+	fieldWatchGroups []FieldWatchGroup,
 	computeInstanceFieldEntities bool,
 	parentGPUsOnly bool,
 ) ([]watchPartition, error) {
@@ -315,6 +323,13 @@ func (d *DeviceWatcher) createGroupsPerGPUModel(
 	partitions := make([]watchPartition, 0, len(models))
 	for _, model := range models {
 		entities := byModel[model]
+		supported := dcpSupportForModel(model, entities[0].DeviceInfo.GPU)
+		if !anyFieldToWatch(fieldWatchGroups, supported) {
+			slog.Debug("No fields to watch for GPU model; skipping its DCGM group",
+				slog.String("gpu_model", model))
+			continue
+		}
+
 		groupID, _, err := createGroupFromEntities(entities)
 		if err != nil {
 			return nil, err
@@ -322,7 +337,7 @@ func (d *DeviceWatcher) createGroupsPerGPUModel(
 		resources.groups = append(resources.groups, *groupID)
 		partitions = append(partitions, watchPartition{
 			groups:       []dcgm.GroupHandle{*groupID},
-			dcpSupported: dcpSupportForModel(model, entities[0].DeviceInfo.GPU),
+			dcpSupported: supported,
 		})
 	}
 	return partitions, nil
@@ -369,6 +384,8 @@ func (d *DeviceWatcher) watchFieldsOnGroups(
 
 		for _, group := range groups {
 			logWatchFieldsCall(deviceInfo, group, fieldGroup, chunk)
+			// Record before watching: a failed call may still leave a partial watch.
+			resources.watches = append(resources.watches, fieldWatch{group: group, fieldGroup: fieldGroup})
 			err = watchFieldGroupSimple(
 				group,
 				fieldGroup,
